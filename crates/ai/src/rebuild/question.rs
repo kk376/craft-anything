@@ -78,7 +78,7 @@ pub fn ask(
             let spec = CliSpec {
                 question: true,
                 deep,
-                logs,
+                logs: logs.clone(),
                 resume: session,
                 preamble: Some(PREAMBLE.into()),
                 ..CliSpec::new(entry.config.clone(), entry.options.clone(), false, Some(ws.root.clone()))
@@ -102,7 +102,25 @@ pub fn ask(
         AnsweredFrom::TheFiles => format!("{PREAMBLE}{}\n\nQuestion: {question}", context(ws)),
     };
     conv.send(&prompt);
-    let (answer, cost_usd) = collect(conv.as_mut(), cancel, WAIT)?;
+    let (answer, from, cost_usd) = match collect(conv.as_mut(), cancel, WAIT) {
+        Err(e) if from == AnsweredFrom::BuildersSession && super::is_missing_session(&e.message) => {
+            let spec = CliSpec {
+                question: true,
+                deep,
+                logs,
+                resume: None,
+                preamble: Some(PREAMBLE.into()),
+                ..CliSpec::new(entry.config.clone(), entry.options.clone(), false, Some(ws.root.clone()))
+            };
+            let mut conv = CliConversation::new(spec);
+            let prompt = format!("{PREAMBLE}{}\n\nQuestion: {question}", context(ws));
+            conv.send(&prompt);
+            let (ans, cost) = collect(&mut conv, cancel, WAIT)?;
+            (ans, AnsweredFrom::TheFiles, cost)
+        }
+        Ok((ans, cost)) => (ans, from, cost),
+        Err(e) => return Err(e),
+    };
     // A copy of a session reports the whole session's running cost, not this question's (a
     // live run said $22.67 for a few cents of cache reads): say nothing rather than that.
     let cost_usd = cost_usd.filter(|_| from != AnsweredFrom::BuildersSession);

@@ -566,6 +566,16 @@ impl Worker {
         }
     }
 
+    /// The brief that tells a builder what to make, seeded from the project workspace.
+    fn make_brief(&self, ws: &Workspace, kind: &dyn kinds::TargetKind, extra: Option<&str>) -> String {
+        let s = self.engine.session();
+        let (deep, ghidra) = (!s.clean_room(), s.settings.ghidra_launcher().is_some());
+        let image_model = s.settings.assets.image_model.clone();
+        drop(s);
+        let cx = BriefCx { ws, deep, ghidra, editor: self.editor.as_deref(), assets: self.assets, image_model: image_model.as_deref() };
+        brief(kind, &cx, extra)
+    }
+
     fn run(
         &mut self,
         ws: &mut Workspace,
@@ -626,17 +636,21 @@ impl Worker {
         let (deep, ghidra) = (!s.clean_room(), s.settings.ghidra_launcher().is_some());
         let image_model = s.settings.assets.image_model.clone();
         drop(s);
-        let cx = BriefCx { ws, deep, ghidra, editor: self.editor.as_deref(), assets: self.assets, image_model: image_model.as_deref() };
-        // The project's settings as they are now, for an agent that carries on its session.
-        let now = || kind.follow_up_sections(&cx).iter().map(|s| format!("\n\n{s}")).collect::<String>() + &pictures_reminder(ws);
+        let now = |cx: &BriefCx| kind.follow_up_sections(cx).iter().map(|s| format!("\n\n{s}")).collect::<String>() + &pictures_reminder(ws);
         let mut prompt = match &opts.message {
             // An agent with a saved session gets the follow-up; one without (an API loop) starts
             // from the brief with the request added.
-            Some(m) if !first && resumable => follow_up(m, kind) + &now(),
+            Some(m) if !first && resumable => {
+                let cx = BriefCx { ws, deep, ghidra, editor: self.editor.as_deref(), assets: self.assets, image_model: image_model.as_deref() };
+                follow_up(m, kind) + &now(&cx)
+            }
             // Carrying on after a stop: the same, told to finish what it was doing.
-            None if carrying_on && !first && has_history => continue_prompt(kind) + &now(),
+            None if carrying_on && !first && has_history => {
+                let cx = BriefCx { ws, deep, ghidra, editor: self.editor.as_deref(), assets: self.assets, image_model: image_model.as_deref() };
+                continue_prompt(kind) + &now(&cx)
+            }
             _ => {
-                let b = brief(kind, &cx, opts.message.as_deref());
+                let b = self.make_brief(ws, kind, opts.message.as_deref());
                 if api_loop { format!("{API_BUILDER}\n\n{b}") } else { b }
             }
         };
@@ -660,7 +674,22 @@ impl Worker {
                 };
                 self.step(ws, Step::Build, Status::Building, doing)?;
                 ws.manifest.awaiting_check = false;
-                let reply = self.turn(ws, agent.as_mut(), &prompt)?;
+                let reply = match self.turn(ws, agent.as_mut(), &prompt) {
+                    Err(e) if is_missing_session(&e.message) && ws.manifest.agent_session.is_some() => {
+                        ws.manifest.agent_session = None;
+                        ws.save()?;
+                        self.step(ws, Step::Build, Status::Building, "The saved conversation isn't on this computer. Starting a fresh session…")?;
+                        let spec = self.agent_spec(ws, &entry, opts);
+                        agent = crate::cli_agents::builder_conversation(spec, self.approver(ws));
+                        let b = self.make_brief(ws, kind, opts.message.as_deref());
+                        prompt = if api_loop { format!("{API_BUILDER}\n\n{b}") } else { b };
+                        if ws.app_dir().join(ORIGINALS_MANIFEST).is_file() {
+                            prompt.push_str(ORIGINALS_READY);
+                        }
+                        self.turn(ws, agent.as_mut(), &prompt)?
+                    }
+                    other => other?,
+                };
                 if !reply.trim().is_empty() {
                     ws.manifest.last_reply = reply.trim().to_string();
                 }
@@ -782,7 +811,9 @@ impl Worker {
         let mut tries = 0u64;
         loop {
             let result = self.converse(ws, agent, &prompt);
-            if let Some(id) = agent.session_id() {
+            if let Some(id) = agent.session_id()
+                && !result.as_ref().err().is_some_and(|e| is_missing_session(&e.message))
+            {
                 ws.manifest.agent_session = Some(id);
                 ws.save()?;
             }
@@ -822,6 +853,7 @@ impl Worker {
         agent.send(text);
         let mut reply = String::new();
         let mut failed = None;
+        let mut saw_missing_session = false;
         loop {
             if self.stop.is_cancelled() {
                 agent.stop();
@@ -841,7 +873,13 @@ impl Worker {
                     {
                         self.decompiled = true
                     }
-                    AgentEvent::Error { message, remediation, .. } => failed = Some((message.clone(), remediation.clone())),
+                    AgentEvent::Output { text } if is_missing_session(text) => saw_missing_session = true,
+                    AgentEvent::Error { message, remediation, .. } => {
+                        if is_missing_session(message) {
+                            saw_missing_session = true;
+                        }
+                        failed = Some((message.clone(), remediation.clone()));
+                    }
                     _ => {}
                 }
                 if let AgentEvent::TurnDone { input_tokens, output_tokens, cost_usd, cost_is_estimate, .. } = &e {
@@ -854,7 +892,8 @@ impl Worker {
                     // An agent-level error (sign-in, crash, limits) ends the run: checking a
                     // build that never happened would only mislead.
                     if let Some((m, r)) = failed {
-                        return Err(ToolError::new(ErrorCode::ProgramFailed, m).with_remediation(r.unwrap_or_default()));
+                        let msg = if saw_missing_session && !is_missing_session(&m) { format!("{m}: No conversation found with session ID") } else { m };
+                        return Err(ToolError::new(ErrorCode::ProgramFailed, msg).with_remediation(r.unwrap_or_default()));
                     }
                     return Ok(reply);
                 }
@@ -921,9 +960,23 @@ pub fn builder_backend(cfg: &crate::AiConfig, named: Option<&str>) -> Result<cra
     })
 }
 
+/// Whether an error or output message says a saved session was not found on this computer (#452).
+pub fn is_missing_session(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("no conversation found")
+        || m.contains("no session found")
+        || m.contains("session not found")
+        || m.contains("session does not exist")
+        || m.contains("invalid session")
+        || m.contains("unknown session")
+}
+
 /// Whether a failed builder turn is worth resuming, rather than needing the person (sign-in,
 /// credit, a missing, broken or too old install).
 fn worth_retrying(message: &str) -> bool {
+    if is_missing_session(message) {
+        return false;
+    }
     let m = message.to_ascii_lowercase();
     !["sign in", "log in", "login", "logged in", "auth", "credit", "billing", "usage limit", "not installed", "install ", crate::cli_agents::TOO_OLD_FOR_MODEL]
         .iter()

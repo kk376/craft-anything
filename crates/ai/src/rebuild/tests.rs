@@ -978,6 +978,126 @@ mod picking_up_a_build {
     }
 
     #[test]
+    fn is_missing_session_identifies_missing_session_variants() {
+        assert!(super::is_missing_session("No conversation found with session ID: 39e5a312-1d59-48be-961c-66512629ffea"));
+        assert!(super::is_missing_session("Claude Code stopped: No conversation found with session ID: 123"));
+        assert!(super::is_missing_session("no conversation found"));
+        assert!(super::is_missing_session("Session not found"));
+        assert!(super::is_missing_session("no session found"));
+        assert!(super::is_missing_session("session does not exist"));
+        assert!(super::is_missing_session("invalid session ID"));
+        assert!(super::is_missing_session("unknown session"));
+
+        assert!(!super::is_missing_session("sign in to Claude Code"));
+        assert!(!super::is_missing_session("rate limit reached"));
+        assert!(!super::is_missing_session("usage limit exceeded"));
+    }
+
+    #[test]
+    fn a_missing_saved_session_falls_back_to_a_fresh_session_with_the_brief() {
+        struct ResumingMock;
+        impl crate::cli_agents::AgentAdapter for ResumingMock {
+            fn ids(&self) -> &'static [&'static str] {
+                &["resuming-mock"]
+            }
+            fn resumes(&self) -> bool {
+                true
+            }
+            fn args(&self, cx: &crate::cli_agents::ArgsCx) -> Vec<String> {
+                let mut a = vec![cx.prompt.to_string()];
+                if let Some(r) = cx.resume {
+                    a.push(format!("--resume={r}"));
+                }
+                a
+            }
+            fn streams_json(&self) -> bool {
+                false
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = dir.path().join("prompts.txt");
+        let agent = dir.path().join("agent.sh");
+        std::fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *missing-session-uuid*)\n\
+                     echo \"No conversation found with session ID: missing-session-uuid\" >&2\n\
+                     exit 1\n\
+                     ;;\n\
+                 esac\n\
+                 for last; do :; done\n\
+                 printf '%s\\n===\\n' \"$last\" >> '{}'\n\
+                 echo Done.\n",
+                prompts.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+        let hub = AiHub::with_stores(engine, dir.path().join("settings.toml"), crate::KeyStore::file_only(dir.path().join("keys.toml")));
+        let mut cfg = hub.config();
+        cfg.upsert(crate::BackendEntry {
+            config: crate::BackendConfig {
+                name: "ResumingMock".into(),
+                kind: BackendKind::AgentCli,
+                model: "resuming-mock".into(),
+                base_url: None,
+                ssh_host: None,
+                enabled: true,
+            },
+            options: crate::BackendOptions { command: Some(agent.display().to_string()), ..Default::default() },
+        });
+        hub.engine.session().settings.ai = cfg.to_table().unwrap();
+        let projects = dir.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let b = Bench { _dir: dir, hub, projects, prompts };
+
+        let mut ws = worked_on(&b);
+        ws.manifest.agent_session = Some("missing-session-uuid".into());
+        ws.save().unwrap();
+
+        let mut kinds = KindRegistry::built_in();
+        kinds.register(Arc::new(FlakyKind));
+        let mut adapters = crate::cli_agents::AgentAdapters::built_in();
+        adapters.register(Arc::new(ResumingMock));
+        let run = RebuildRun::start(
+            &b.hub,
+            Workspace::open(&ws.root).unwrap(),
+            RunOptions { kinds, adapters, backend: Some("ResumingMock".into()), ..RunOptions::default() },
+        )
+        .unwrap();
+
+        let began = Instant::now();
+        let mut ok = None;
+        while ok.is_none() {
+            assert!(began.elapsed() < Duration::from_secs(30), "the run never finished");
+            match run.rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(RunEvent::Finished { ok: o, .. }) => ok = Some(o),
+                Ok(_) => {}
+                Err(e) => panic!("the run went away: {e}"),
+            }
+        }
+        assert!(ok.unwrap());
+
+        let feed = feed::load(&Workspace::open(&ws.root).unwrap());
+        let fallback_step = feed.iter().find(|i| match i {
+            feed::FeedItem::Step { text, .. } => text.contains("The saved conversation isn't on this computer"),
+            _ => false,
+        });
+        assert!(fallback_step.is_some(), "feed recorded fallback: {feed:?}");
+
+        let told = std::fs::read_to_string(&b.prompts).unwrap();
+        assert!(told.contains("Their request"), "fresh session received full brief: {told}");
+
+        let opened = Workspace::open(&ws.root).unwrap();
+        assert_ne!(opened.manifest.agent_session.as_deref(), Some("missing-session-uuid"), "manifest cleared missing session");
+    }
+
+    #[test]
     fn a_check_that_could_not_run_gets_a_second_go_and_the_build_is_not_blamed() {
         let b = bench();
         let mut ws = worked_on(&b);

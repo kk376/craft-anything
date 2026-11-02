@@ -285,7 +285,12 @@ impl AgentAdapter for ClaudeCode {
                     p.output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
                 }
                 if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
-                    let why = if s("result").is_empty() { s("subtype") } else { s("result") };
+                    let mut why = if s("result").is_empty() { s("subtype") } else { s("result") };
+                    if (why.is_empty() || why == "error_during_execution")
+                        && let Some(err) = &p.last_stderr
+                    {
+                        why = err.clone();
+                    }
                     let (message, remediation) = claude_code_failure(&why);
                     out.push(AgentEvent::Error { message, remediation, log: None });
                 }

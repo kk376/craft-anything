@@ -244,6 +244,7 @@ pub struct StreamParser {
     pub output_tokens: u64,
     pub cost_usd: Option<f64>,
     pub saw_result: bool,
+    pub last_stderr: Option<String>,
 }
 
 fn short_tool(name: &str) -> String {
@@ -277,7 +278,24 @@ fn summary_of(s: &str) -> String {
 
 impl StreamParser {
     pub fn new(adapter: Arc<dyn AgentAdapter>) -> Self {
-        StreamParser { adapter, session_id: None, tool_names: HashMap::new(), input_tokens: 0, output_tokens: 0, cost_usd: None, saw_result: false }
+        StreamParser {
+            adapter,
+            session_id: None,
+            tool_names: HashMap::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: None,
+            saw_result: false,
+            last_stderr: None,
+        }
+    }
+
+    /// Keep a line of standard error output in case a turn fails.
+    pub fn note_stderr(&mut self, line: &str) {
+        let t = line.trim();
+        if !t.is_empty() {
+            self.last_stderr = Some(t.to_string());
+        }
     }
 
     /// Events for one output line.
@@ -525,7 +543,7 @@ fn run_cli(spec: &CliSpec, text: &str, tx: &Sender<AgentEvent>, stop: &Stop, ses
     let _ =
         tx.send(AgentEvent::Status { text: format!("Asking {}{}…", display_for(&agent), remote.as_ref().map(|h| format!(" on {h}")).unwrap_or_default()) });
     let parser = Arc::new(Mutex::new(StreamParser::new(adapter.clone())));
-    let (p2, tx2, tx_err) = (parser.clone(), tx.clone(), tx.clone());
+    let (p2, p_err, tx2, tx_err) = (parser.clone(), parser.clone(), tx.clone(), tx.clone());
     let stop2 = stop.clone();
     let mut proc = (if remote.is_none() { adapter.process(&prog) } else { Process::new(&prog) })
         .args(&argv)
@@ -544,6 +562,7 @@ fn run_cli(spec: &CliSpec, text: &str, tx: &Sender<AgentEvent>, stop: &Stop, ses
         })
         .on_stderr_line(move |l| {
             if !l.trim().is_empty() {
+                p_err.lock().unwrap_or_else(PoisonError::into_inner).note_stderr(l);
                 let _ = tx_err.send(AgentEvent::Output { text: l.to_string() });
             }
         })
@@ -1029,6 +1048,26 @@ mod tests {
         assert!(matches!(&events[2], AgentEvent::ToolFinished { tool, ok: true, evidence_id: Some(id), .. } if tool == "core_session_show" && *id == ev));
         assert!(matches!(&events[3], AgentEvent::Status { .. }));
         assert_eq!((p.input_tokens, p.output_tokens, p.cost_usd), (10, 7, Some(0.12)));
+    }
+
+    #[test]
+    fn claude_code_error_during_execution_uses_stderr_when_result_is_empty() {
+        let mut p = StreamParser::new(adapter_for("claude-code"));
+        p.note_stderr("No conversation found with session ID: 39e5a312-1d59-48be-961c-66512629ffea");
+        let result_line = json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "result": ""
+        })
+        .to_string();
+        let events = p.line(&result_line);
+        assert_eq!(events.len(), 1);
+        let AgentEvent::Error { message, .. } = &events[0] else { panic!("expected Error event") };
+        assert!(
+            message.contains("No conversation found with session ID: 39e5a312-1d59-48be-961c-66512629ffea"),
+            "error should contain the stderr reason instead of raw error_during_execution: {message}"
+        );
     }
 
     #[test]
